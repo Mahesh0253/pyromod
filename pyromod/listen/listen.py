@@ -64,6 +64,7 @@ class Client:
     def clear_listener(self, chat_id, future):
         if future == self.listening[chat_id]['future']:
             self.listening.pop(chat_id, None)
+            logger.info(f'Closed conversation: {chat_id}')
 
     @patchable
     def cancel_listener(self, chat_id):
@@ -106,7 +107,7 @@ class MessageHandler:
             message.stop_propagation()
 
         listener = client.listening.get(message.chat.id)
-        if listener and not listener['future'].done():
+        if listener and not listener['future'].done() and not listener['filters']:
             listener['future'].set_result(message)
             return
 
@@ -121,7 +122,10 @@ class MessageHandler:
         listener = client.listening.get(update.chat.id)
 
         if listener and not listener['future'].done():
-            return await listener['filters'](client, update) if callable(listener['filters']) else True
+            result = await listener['filters'](client, update) if callable(listener['filters']) else True
+            if result:
+                listener['filters'] = None
+                return True
 
         if callable(self.filters):
             if inspect.iscoroutinefunction(self.filters.__call__):
