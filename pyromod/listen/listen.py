@@ -20,11 +20,10 @@ along with pyromod.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
 import asyncio
-import functools
-from contextlib import suppress
+from functools import partial
 
 import pyrogram
-from pyrogram.errors import QueryIdInvalid
+from pyrogram.errors import QueryIdInvalid, MessageNotModified
 
 from ..utils import patch, patchable
 
@@ -39,7 +38,6 @@ class Client:
     def __init__(self, *args, **kwargs):
         self.listening = {}
         self.using_mod = True
-
         self.old__init__(*args, **kwargs)
 
     @patchable
@@ -48,8 +46,8 @@ class Client:
             chat = await self.get_chat(chat_id)
             chat_id = chat.id
 
-        future = asyncio.get_event_loop().create_future()
-        future.add_done_callback(functools.partial(self.clear_listener, chat_id))
+        future = self.loop.create_future()
+        future.add_done_callback(partial(self.clear_listener, chat_id))
         self.listening.update({chat_id: {"future": future, "filters": filters}})
         return await asyncio.wait_for(future, timeout)
 
@@ -73,23 +71,6 @@ class Client:
             return
 
         listener['future'].set_exception(asyncio.CancelledError())
-        self.clear_listener(chat_id, listener['future'])
-
-
-@patch(pyrogram.handlers.callback_query_handler.CallbackQueryHandler)
-class CallbackQueryHandler:
-
-    @patchable
-    def __init__(self, callback: callable, filters=None):
-        self.user_callback = callback
-        self.old__init__(self.resolve_listener, filters)
-
-    @patchable
-    async def resolve_listener(self, client, update, *args):
-        try:
-            await self.user_callback(client, update, *args)
-        except (QueryIdInvalid) as e:
-            logger.warning(f'{e.__class__.__name__}')
 
 
 @patch(pyrogram.handlers.message_handler.MessageHandler)
@@ -97,7 +78,7 @@ class MessageHandler:
 
     @patchable
     def __init__(self, callback: callable, filters=None):
-        self.user_callback = callback
+        self.org_callback = callback
         self.old__init__(self.resolve_listener, filters)
 
     @patchable
@@ -114,34 +95,39 @@ class MessageHandler:
         elif listener and listener['future'].done():
             client.clear_listener(message.chat.id, listener['future'])
 
-        with suppress(QueryIdInvalid):
-            await self.user_callback(client, message, *args)
+        await self.org_callback(client, message, *args)
 
     @patchable
     async def check(self, client, update):
         listener = client.listening.get(update.chat.id)
 
         if listener and not listener['future'].done():
-            result = await listener['filters'](client, update) if callable(listener['filters']) else True
-            if result:
-                listener['filters'] = None
+            listener_filters = listener['filters']
+            if not listener_filters:
+                return True
+            elif callable(listener_filters):
+                if inspect.iscoroutinefunction(listener_filters.__call__):
+                    result = await listener_filters(client, update)
+                else:
+                    result = listener_filters(client, update)
+
+                if result:
+                    listener['filters'] = None
+                    return True
+            else:
                 return True
 
         if callable(self.filters):
             if inspect.iscoroutinefunction(self.filters.__call__):
                 return await self.filters(client, update)
             else:
-                return await client.loop.run_in_executor(
-                    client.executor,
-                    self.filters,
-                    client, update
-                )
+                return self.filters(client, update)
 
         return True
 
 
 @patch(pyrogram.types.user_and_chats.chat.Chat)
-class Chat(pyrogram.types.Chat):
+class Chat:
 
     @patchable
     def listen(self, *args, **kwargs):
@@ -157,7 +143,7 @@ class Chat(pyrogram.types.Chat):
 
 
 @patch(pyrogram.types.user_and_chats.user.User)
-class User(pyrogram.types.User):
+class User:
 
     @patchable
     def listen(self, *args, **kwargs):
@@ -173,7 +159,7 @@ class User(pyrogram.types.User):
 
 
 @patch(pyrogram.types.messages_and_media.message.Message)
-class Message(pyrogram.types.Message):
+class Message:
 
     @patchable
     def listen(self, *args, **kwargs):
@@ -189,3 +175,29 @@ class Message(pyrogram.types.Message):
     @patchable
     def cancel_listener(self):
         return self._client.cancel_listener(self.chat.id)
+
+
+@patch(pyrogram.handlers.callback_query_handler.CallbackQueryHandler)
+class CallbackQueryHandler:
+
+    @patchable
+    def __init__(self, callback: callable, filters=None):
+        self.org_callback = callback
+        self.old__init__(self.resolve_listener, filters)
+
+    @patchable
+    async def resolve_listener(self, client, update, *args):
+        try:
+            await self.org_callback(client, update, *args)
+        except (QueryIdInvalid, MessageNotModified) as e:
+            logger.warning(f'{e.__class__.__name__}')
+
+    @patchable
+    async def check(self, client, update):
+        if callable(self.filters):
+            if inspect.iscoroutinefunction(self.filters.__call__):
+                return await self.filters(client, update)
+            else:
+                return self.filters(client, update)
+
+        return True
